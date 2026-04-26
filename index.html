@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>Bahnhofsanzeige</title>
+
+<style>
+body {
+  margin: 0;
+  background: #0b1a2a;
+  color: white;
+  font-family: Arial, Helvetica, sans-serif;
+  padding: 20px;
+}
+
+h1 {
+  margin-bottom: 10px;
+}
+
+.clock {
+  position: absolute;
+  top: 25px;
+  right: 25px;
+  font-size: 24px;
+  font-weight: bold;
+}
+
+select, button {
+  margin-bottom: 20px;
+  padding: 8px 12px;
+  font-size: 16px;
+  background: #102238;
+  color: white;
+  border: 1px solid #35506a;
+  border-radius: 6px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 18px;
+}
+
+th, td {
+  padding: 10px;
+  border-bottom: 1px solid #333;
+  text-align: left;
+}
+
+th {
+  color: #aaa;
+}
+
+tr.train-row {
+  cursor: pointer;
+}
+
+tr.train-row:hover td {
+  background: #14304a;
+}
+
+.delay {
+  color: orange;
+  font-weight: bold;
+}
+
+.tomorrow {
+  color: orange;
+  font-size: 14px;
+  margin-left: 8px;
+}
+
+.empty {
+  text-align: center;
+  color: #aaa;
+  padding: 30px;
+}
+
+.details td {
+  background: #06101b;
+  color: #dbeeff;
+  padding: 14px 20px;
+}
+
+.stop-list {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  gap: 8px 18px;
+  max-width: 700px;
+}
+
+.stop-time {
+  color: #ffd166;
+  font-weight: bold;
+}
+
+.stop-name {
+  color: white;
+}
+
+.hint {
+  color: #9fb2c7;
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+</style>
+</head>
+
+<body>
+
+<audio id="jingle" src="sound.mp3"></audio>
+
+<h1 id="title">LIVE Bahnhofsanzeige – Luxembourg Gare</h1>
+<div class="clock" id="clock">--:--</div>
+
+<select id="station" onchange="loadData(true)">
+  <option value="luxembourg">Luxembourg</option>
+  <option value="esch">Esch-sur-Alzette</option>
+  <option value="ettelbruck">Ettelbruck</option>
+  <option value="bettembourg">Bettembourg</option>
+  <option value="dudelange">Dudelange</option>
+</select>
+
+<button onclick="enableSound()">Sound aktivieren</button>
+
+<div class="hint">Tipp: Auf eine Fahrt klicken, um Zwischenhalte anzuzeigen.</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Zeit</th>
+      <th>Zug</th>
+      <th>Ziel</th>
+      <th>Gleis</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody id="table"></tbody>
+</table>
+
+<script>
+const stationNames = {
+  luxembourg: "Luxembourg Gare",
+  esch: "Esch-sur-Alzette Gare",
+  ettelbruck: "Ettelbruck Gare",
+  bettembourg: "Bettembourg Gare",
+  dudelange: "Dudelange Gare"
+};
+
+let lastFirstTrainKey = "";
+let soundEnabled = false;
+let firstLoad = true;
+let openDetailsKey = null;
+
+function enableSound() {
+  soundEnabled = true;
+  speak("Durchsagen sind aktiviert.");
+}
+
+function updateClock() {
+  const now = new Date();
+  document.getElementById("clock").textContent =
+    now.toLocaleTimeString("de-DE", {
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+}
+
+function speak(text) {
+  if (!soundEnabled) return;
+
+  window.speechSynthesis.cancel();
+
+  const msg = new SpeechSynthesisUtterance(text);
+  msg.lang = "de-DE";
+  msg.rate = 0.95;
+  msg.pitch = 1;
+
+  window.speechSynthesis.speak(msg);
+}
+
+function announceTrain(train) {
+  if (!soundEnabled || !train) return;
+
+  const jingle = document.getElementById("jingle");
+
+  const time = train.time.substring(0, 5).replace(":", " Uhr ");
+  const destination = train.destination.replace(", Gare", "");
+  const track = train.track || "-";
+  const delay =
+    train.delay && train.delay !== "pünktlich"
+      ? `mit ${train.delay} Verspätung`
+      : "pünktlich";
+
+  const text =
+    `Achtung. Der nächste Zug ist ${train.line} nach ${destination}. ` +
+    `Abfahrt um ${time}. Gleis ${track}. ${delay}.`;
+
+  try {
+    jingle.currentTime = 0;
+    jingle.play();
+
+    setTimeout(() => {
+      speak(text);
+    }, 1200);
+  } catch (e) {
+    speak(text);
+  }
+}
+
+function makeKey(train) {
+  return `${train.time}-${train.line}-${train.destination}-${train.track}`;
+}
+
+async function toggleStops(train, row) {
+  const key = makeKey(train);
+
+  const nextRow = row.nextElementSibling;
+  if (nextRow && nextRow.classList.contains("details")) {
+    nextRow.remove();
+    openDetailsKey = null;
+    return;
+  }
+
+  document.querySelectorAll("tr.details").forEach(r => r.remove());
+  openDetailsKey = key;
+
+  const detailsRow = document.createElement("tr");
+  detailsRow.className = "details";
+  detailsRow.innerHTML = `
+    <td colspan="5">Zwischenhalte werden geladen...</td>
+  `;
+  row.after(detailsRow);
+
+  try {
+    const url =
+      `/api/stops?line=${encodeURIComponent(train.line)}` +
+      `&time=${encodeURIComponent(train.time)}` +
+      `&destination=${encodeURIComponent(train.destination)}`;
+
+    const res = await fetch(url);
+    const stops = await res.json();
+
+    if (!stops || stops.length === 0) {
+      detailsRow.innerHTML = `
+        <td colspan="5">Keine Zwischenhalte gefunden.</td>
+      `;
+      return;
+    }
+
+    const html = stops.map(stop => `
+      <div class="stop-time">${stop.time}</div>
+      <div class="stop-name">${stop.stop}</div>
+    `).join("");
+
+    detailsRow.innerHTML = `
+      <td colspan="5">
+        <strong>Zwischenhalte:</strong>
+        <div class="stop-list">${html}</div>
+      </td>
+    `;
+  } catch (err) {
+    console.error(err);
+    detailsRow.innerHTML = `
+      <td colspan="5">Fehler beim Laden der Zwischenhalte.</td>
+    `;
+  }
+}
+
+async function loadData(forceAnnounce = false) {
+  try {
+    const station = document.getElementById("station").value;
+    document.getElementById("title").textContent =
+      "LIVE Bahnhofsanzeige – " + stationNames[station];
+
+    const res = await fetch(`/.netlify/functions/trains?stop=${station}`);
+    const data = await res.json();
+
+    const table = document.getElementById("table");
+    table.innerHTML = "";
+
+    if (!data || data.length === 0) {
+      table.innerHTML = `
+        <tr>
+          <td colspan="5" class="empty">Keine Abfahrten verfügbar</td>
+        </tr>
+      `;
+      return;
+    }
+
+    data.forEach(train => {
+      const row = document.createElement("tr");
+      row.className = "train-row";
+      const isDelayed = train.delay !== "pünktlich";
+
+      row.innerHTML = `
+        <td>
+          ${train.time.substring(0,5)}
+          ${train.note === "morgen" ? '<span class="tomorrow">MORGEN</span>' : ""}
+        </td>
+        <td>${train.line}</td>
+        <td>${train.destination}</td>
+        <td>${train.track}</td>
+        <td class="${isDelayed ? "delay" : ""}">
+          ${isDelayed ? train.delay.toUpperCase() : "pünktlich"}
+        </td>
+      `;
+
+      row.addEventListener("click", () => toggleStops(train, row));
+
+      table.appendChild(row);
+    });
+
+    const firstTrain = data[0];
+    const firstTrainKey =
+      `${station}-${firstTrain.time}-${firstTrain.line}-${firstTrain.destination}-${firstTrain.track}`;
+
+    if (!firstLoad && (forceAnnounce || firstTrainKey !== lastFirstTrainKey)) {
+      announceTrain(firstTrain);
+    }
+
+    lastFirstTrainKey = firstTrainKey;
+    firstLoad = false;
+
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+updateClock();
+loadData();
+
+setInterval(updateClock, 1000);
+setInterval(loadData, 10000);
+</script>
+
+</body>
+</html>
